@@ -22,18 +22,36 @@ class ESP32ConfigGUI:
         
         # Load config
         self.config = configparser.ConfigParser()
-        self.config_file = "config.ini"
+        self.template_config_file = "config.ini"  # Template config (read-only reference)
+        self.deployment_config_file = None  # Will be set based on deployment path
         self.load_config()
         
         self.create_widgets()
         
     def load_config(self):
-        """Load configuration from file"""
-        if os.path.exists(self.config_file):
-            self.config.read(self.config_file)
+        """Load configuration from deployment or template file"""
+        # First, load the template config to get deployment path
+        if os.path.exists(self.template_config_file):
+            temp_config = configparser.ConfigParser()
+            temp_config.read(self.template_config_file)
+            deployment_path = temp_config.get('GENERAL', 'deployment_path', fallback='./test_deployment')
+        else:
+            deployment_path = './test_deployment'
+            
+        # Set deployment config file path
+        self.deployment_config_file = os.path.join(deployment_path, "config.ini")
+        
+        # Try to load from deployment config first, then template, then create default
+        if os.path.exists(self.deployment_config_file):
+            self.log_status(f"📋 Loading config from deployment: {self.deployment_config_file}")
+            self.config.read(self.deployment_config_file)
+        elif os.path.exists(self.template_config_file):
+            self.log_status(f"📋 Loading template config: {self.template_config_file}")
+            self.config.read(self.template_config_file)
         else:
             # Create default config
             self.create_default_config()
+
             
     def create_default_config(self):
         """Create default configuration"""
@@ -69,12 +87,22 @@ class ESP32ConfigGUI:
                 'off_button_gpio': gpio_pairs[i][1]
             }
         
-        self.save_config()
+        # Don't auto-save default config - let user save when ready
         
     def save_config(self):
-        """Save configuration to file"""
-        with open(self.config_file, 'w') as f:
+        """Save configuration to deployment directory"""
+        # Ensure deployment directory exists
+        deployment_path = self.deploy_path_var.get()
+        os.makedirs(deployment_path, exist_ok=True)
+        
+        # Update deployment config file path
+        self.deployment_config_file = os.path.join(deployment_path, "config.ini")
+        
+        with open(self.deployment_config_file, 'w') as f:
             self.config.write(f)
+        
+        self.log_status(f"✅ Configuration saved to: {self.deployment_config_file}")
+        self.log_status(f"📄 Template config remains unchanged: {self.template_config_file}")
             
     def create_widgets(self):
         """Create GUI widgets"""
@@ -175,11 +203,53 @@ class ESP32ConfigGUI:
         self.active_pcs_label.grid(row=3, column=0, columnspan=2, pady=5)
         self.update_active_pcs_label()
         
+        # Add config file status
+        self.config_status_label = ttk.Label(parent, text="", font=('Arial', 8), foreground='green')
+        self.config_status_label.grid(row=4, column=0, columnspan=2, pady=5)
+        self.update_config_status_label()
+        
     def browse_deploy_path(self):
         """Browse for deployment path"""
         path = filedialog.askdirectory(initialdir=self.deploy_path_var.get())
         if path:
             self.deploy_path_var.set(path)
+            # Update deployment config file path and try to load existing config
+            new_deployment_config = os.path.join(path, "config.ini")
+            if os.path.exists(new_deployment_config):
+                self.deployment_config_file = new_deployment_config
+                self.config.read(new_deployment_config)
+                self.refresh_gui_from_config()
+                self.log_status(f"📋 Loaded existing config from: {new_deployment_config}")
+            else:
+                self.deployment_config_file = new_deployment_config
+                self.log_status(f"📁 New deployment path set: {path}")
+                
+    def refresh_gui_from_config(self):
+        """Refresh GUI fields from loaded config"""
+        try:
+            # Update ESP32 fields
+            for key, var in self.esp32_vars.items():
+                if self.config.has_option('ESP32', key):
+                    var.set(self.config.get('ESP32', key))
+                    
+            # Update general fields
+            if self.config.has_option('GENERAL', 'num_pcs'):
+                self.num_pcs_var.set(self.config.get('GENERAL', 'num_pcs'))
+            if self.config.has_option('GENERAL', 'deployment_path'):
+                self.deploy_path_var.set(self.config.get('GENERAL', 'deployment_path'))
+                
+            # Update PC fields
+            num_pcs = int(self.num_pcs_var.get())
+            for pc_num in range(1, num_pcs + 1):
+                if pc_num in self.pc_vars and self.config.has_section(f'PC{pc_num}'):
+                    for key, var in self.pc_vars[pc_num].items():
+                        if self.config.has_option(f'PC{pc_num}', key):
+                            var.set(self.config.get(f'PC{pc_num}', key))
+                            
+            self.update_pc_tabs(num_pcs)
+            self.update_active_pcs_label()
+        except Exception as e:
+            self.log_status(f"⚠️ Warning: Error refreshing GUI: {e}")
             
     def on_num_pcs_changed(self, *args):
         """Callback when number of PCs changes"""
@@ -257,6 +327,20 @@ class ESP32ConfigGUI:
         except (ValueError, AttributeError):
             pass
             
+    def update_config_status_label(self):
+        """Update the label showing which config file is being used"""
+        try:
+            if hasattr(self, 'deployment_config_file') and self.deployment_config_file:
+                if os.path.exists(self.deployment_config_file):
+                    status_text = f"📁 Using deployment config: {os.path.basename(os.path.dirname(self.deployment_config_file))}/config.ini"
+                else:
+                    status_text = f"📝 Will create: {os.path.basename(os.path.dirname(self.deployment_config_file))}/config.ini"
+            else:
+                status_text = "📄 Using template config (will save to deployment when ready)"
+            self.config_status_label.config(text=status_text)
+        except AttributeError:
+            pass
+            
     def create_pc_tab(self, parent):
         """Create PC configuration tab"""
         # Create notebook for PC tabs
@@ -327,9 +411,11 @@ IP Address Format: 192.168.1.100
 1. Configure ESP32 settings in the ESP32 Config tab
 2. Set the number of PCs and deployment path in General Settings
 3. Configure each PC in the PC Configuration tab
-4. Click 'Save Configuration' to save your settings
+4. Click 'Save Configuration' to save to deployment directory
 5. Click 'Generate Templates' to create deployment files
 6. Copy the generated PC folders to each respective computer
+
+Note: Configuration is saved to the deployment directory, keeping the root config.ini as a clean template.
         """
         
         ttk.Label(parent, text=instructions, justify='left').pack(pady=10)
@@ -368,6 +454,9 @@ IP Address Format: 192.168.1.100
             self.config.set('GENERAL', 'num_pcs', self.num_pcs_var.get())
             self.config.set('GENERAL', 'deployment_path', self.deploy_path_var.get())
             
+            # Update deployment config file path
+            self.deployment_config_file = os.path.join(self.deploy_path_var.get(), "config.ini")
+            
             # Update PC configs
             num_pcs = int(self.num_pcs_var.get())
             for pc_num in range(1, num_pcs + 1):
@@ -376,6 +465,7 @@ IP Address Format: 192.168.1.100
                         self.config.set(f'PC{pc_num}', key, var.get())
                         
             self.save_config()
+            self.update_config_status_label()
             self.log_status("✅ Configuration saved successfully!")
             
         except Exception as e:
@@ -391,7 +481,10 @@ IP Address Format: 192.168.1.100
             
             self.log_status("🚀 Starting template generation...")
             
-            generator = TemplateGenerator(self.config_file)
+            # Use deployment config file if it exists, otherwise use template config
+            config_to_use = self.deployment_config_file if self.deployment_config_file and os.path.exists(self.deployment_config_file) else self.template_config_file
+            
+            generator = TemplateGenerator(config_to_use)
             generator.generate_all()
             
             self.log_status("✅ Template generation completed!")
@@ -439,8 +532,12 @@ IP Address Format: 192.168.1.100
         try:
             import time
             backup_name = f"config_backup_{int(time.time())}.ini"
-            if os.path.exists(self.config_file):
-                shutil.copy2(self.config_file, backup_name)
+            
+            # Use deployment config if it exists, otherwise use template config
+            config_to_backup = self.deployment_config_file if self.deployment_config_file and os.path.exists(self.deployment_config_file) else self.template_config_file
+            
+            if os.path.exists(config_to_backup):
+                shutil.copy2(config_to_backup, backup_name)
                 self.log_status(f"✅ Configuration backed up to: {backup_name}")
                 messagebox.showinfo("Success", f"Configuration backed up to:\n{backup_name}")
             else:
@@ -463,9 +560,13 @@ IP Address Format: 192.168.1.100
             
     def log_status(self, message):
         """Log status message"""
-        self.status_text.insert(tk.END, f"{message}\n")
-        self.status_text.see(tk.END)
-        self.root.update()
+        # Handle case where status_text might not exist yet (during init)
+        if hasattr(self, 'status_text'):
+            self.status_text.insert(tk.END, f"{message}\n")
+            self.status_text.see(tk.END)
+            self.root.update()
+        else:
+            print(message)  # Fallback to console during initialization
 
 
 def main():
